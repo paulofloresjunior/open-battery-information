@@ -64,6 +64,48 @@ void cmd_and_read_cc(byte *cmd, uint8_t cmd_len, byte *rsp, uint8_t rsp_len) {
 	}
 }
 
+/* Debug/probe command for reverse-engineering batteries the web UI doesn't know yet.
+ * Unlike the other commands, it exposes what they hide: the idle line level, the reset
+ * presence pulse, and the timing between bytes (older BMSs may need different delays).
+ *
+ * data: [flags, post_reset_delay (x10 us), inter_byte_delay (us), bytes to write...]
+ *   flags bit0: issue a 1-Wire reset before writing
+ * rsp:  [idle_line_level, presence (0xFF = reset skipped), rsp_len - 2 bytes read...]
+ *
+ * Returns the number of payload bytes produced (0 when the request is malformed). */
+#define DEBUG_FLAG_RESET 0x01
+
+uint8_t cmd_debug_raw(byte *data, uint8_t data_len, byte *rsp, uint8_t rsp_len) {
+	if (data_len < 3 || rsp_len < 2) {
+		return 0;
+	}
+	uint8_t flags = data[0];
+	uint16_t post_reset_delay_us = data[1] * 10;
+	uint8_t inter_byte_delay_us = data[2];
+
+	/* Idle level with ENABLE already high: a stuck-low line points to wiring or a BMS
+	 * holding the bus, which reset() alone can't tell apart from "no device". */
+	pinMode(ONEWIRE_PIN, INPUT);
+	rsp[0] = digitalRead(ONEWIRE_PIN);
+
+	rsp[1] = 0xFF;
+	if (flags & DEBUG_FLAG_RESET) {
+		rsp[1] = makita.reset();
+		delayMicroseconds(post_reset_delay_us);
+	}
+
+	for (uint8_t i = 3; i < data_len; i++) {
+		delayMicroseconds(inter_byte_delay_us);
+		makita.write(data[i], 0);
+	}
+
+	for (uint8_t i = 2; i < rsp_len; i++) {
+		delayMicroseconds(inter_byte_delay_us);
+		rsp[i] = makita.read();
+	}
+	return rsp_len;
+}
+
 void cmd_and_read(byte *cmd, uint8_t cmd_len, byte *rsp, uint8_t rsp_len) {
 	int i;
 	makita.reset();
@@ -165,6 +207,13 @@ void read_usb() {
                 break;
             case 0xCC:
                 cmd_and_read_cc(data, len, &rsp[2], rsp_len);
+                break;
+            case 0xD0:
+                /* rsp has 255 bytes and 2 go to the header */
+                if (rsp_len > 253) {
+                    rsp_len = 253;
+                }
+                rsp_len = cmd_debug_raw(data, len, &rsp[2], rsp_len);
                 break;
             default:
                 rsp_len = 0;
