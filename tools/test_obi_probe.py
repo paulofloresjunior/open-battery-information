@@ -42,6 +42,13 @@ class FakeFirmwareSerial:
 
 # Worked example from Maxim Application Note 27 (CRC8 = 0xA2).
 VALID_ROM = bytes.fromhex("021CB801000000A2")
+# Captured from a real BL1830 (F0513 chip): identical at every timing, yet the Maxim CRC
+# doesn't match. The first version of the tool reported this as a failure.
+BL1830_ROM = bytes.fromhex("100B0D0200140157")
+
+
+def rom_step(name: str, rom: bytes) -> obi.Step:
+    return obi.Step(name, "", ok=True, response=obi.hex_dump(rom), decoded=obi.decode_rom(rom))
 
 
 class FramingTests(unittest.TestCase):
@@ -82,9 +89,17 @@ class LinkTests(unittest.TestCase):
 
 
 class DecodeTests(unittest.TestCase):
-    def test_rom_crc_ok_and_fail(self):
-        self.assertEqual(obi.decode_rom(VALID_ROM)["crc"], "OK")
-        self.assertTrue(obi.decode_rom(VALID_ROM[:7] + b"\x00")["crc"].startswith("FAIL"))
+    def test_makita_rom_crc_mismatch_is_not_treated_as_error(self):
+        decoded = obi.decode_rom(BL1830_ROM)
+        self.assertNotIn("hint", decoded)
+        self.assertTrue(decoded["maxim_crc"].startswith("no match"))
+        self.assertEqual(decoded["first_bytes_as_date"], "13/11/2016")
+
+    def test_blank_rom_is_flagged(self):
+        self.assertIn("hint", obi.decode_rom(b"\xFF" * 8))
+
+    def test_f0513_temperature_in_celsius(self):
+        self.assertEqual(obi.decode_known("f0513_temp", bytes.fromhex("CE0B")), {"temp_c": "30.22"})
 
     def test_all_ff_is_flagged_as_no_answer(self):
         self.assertIn("no answer", obi.decode_known("lxt_data", b"\xFF" * 29)["hint"])
@@ -106,6 +121,21 @@ class ProbeTests(unittest.TestCase):
         fake = FakeFirmwareSerial({obi.CMD_VERSION: bytes(3), obi.CMD_DEBUG_RAW: bytes([1, 0])})
         report = obi.probe(obi.ObiLink(fake, timeout_s=0.1), lambda _: None)
         self.assertIn("no presence", report["summary"][0])
+
+    def test_rom_identical_across_sweep_is_stable(self):
+        steps = [rom_step(f"rom@{us}us", BL1830_ROM) for us in obi.INTER_BYTE_SWEEP_US]
+        self.assertTrue(obi.summarize_rom(steps).startswith("ROM stable"))
+
+    def test_rom_disagreement_is_unstable(self):
+        steps = [rom_step("rom@60us", BL1830_ROM), rom_step("rom@90us", BL1830_ROM),
+                 rom_step("rom@120us", VALID_ROM)]
+        summary = obi.summarize_rom(steps)
+        self.assertTrue(summary.startswith("ROM unstable (2/3"))
+        self.assertIn("rom@60us, rom@90us", summary)
+
+    def test_all_blank_rom_reads(self):
+        steps = [rom_step("rom@60us", b"\xFF" * 8)]
+        self.assertIn("blank", obi.summarize_rom(steps))
 
     def test_compare_marks_differences(self):
         def dump(response: str) -> dict[str, object]:

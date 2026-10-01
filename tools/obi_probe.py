@@ -21,6 +21,7 @@ import argparse
 import json
 import sys
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -195,13 +196,20 @@ class Step:
     decoded: dict[str, str] = field(default_factory=dict)
 
 
+def is_blank(payload: bytes) -> bool:
+    return all(b == 0xFF for b in payload) or all(b == 0x00 for b in payload)
+
+
 def decode_rom(rom: bytes) -> dict[str, str]:
-    crc_ok = crc8_maxim(rom[:7]) == rom[7]
+    if is_blank(rom):
+        return {"hint": "blank ROM (all 0xFF/0x00): no answer"}
+    # Informational only: a real BL1830 (F0513) returned the same ROM at every timing with a
+    # non-matching CRC, and the web UI reads bytes 0-2 as the manufacturing date, so Makita
+    # ROMs aren't Dallas-style IDs. Read consistency is the validity check (see summarize).
+    crc_matches = crc8_maxim(rom[:7]) == rom[7]
     return {
-        "family_code": f"0x{rom[0]:02X}",
-        "serial": hex_dump(rom[1:7]),
-        "crc": "OK" if crc_ok else f"FAIL (calc 0x{crc8_maxim(rom[:7]):02X}, got 0x{rom[7]:02X})",
-        "all_ff": str(all(b == 0xFF for b in rom)),
+        "first_bytes_as_date": f"{rom[2]:02d}/{rom[1]:02d}/20{rom[0]:02d}",
+        "maxim_crc": "match" if crc_matches else "no match (normal for Makita BMS)",
     }
 
 
@@ -214,7 +222,6 @@ def decode_known(name: str, payload: bytes) -> dict[str, str]:
     if name == "lxt_msg" and len(payload) >= 40:
         decoded = decode_rom(payload[:8])
         decoded.update({
-            "mfg_date_if_lxt": f"{payload[2]:02d}/{payload[1]:02d}/20{payload[0]:02d}",
             "capacity_if_lxt": f"{nibble_swap(payload[24]) / 10:.1f}Ah",
             "lock_if_lxt": "LOCKED" if payload[28] & 0x0F else "UNLOCKED",
             "status_if_lxt": f"0x{payload[27]:02X}",
@@ -229,8 +236,12 @@ def decode_known(name: str, payload: bytes) -> dict[str, str]:
     if name in ("f0513_model", "f0513_version"):
         # Firmware stores these 2 bytes swapped; the site renders them as "BL" + hex.
         return {"as_model": f"BL{payload[0]:X}{payload[1]:X}"}
+    if name == "f0513_temp":
+        return {"temp_c": f"{u16le(payload, 0) / 100:.2f}"}
+    if name.startswith("f0513_vcell"):
+        return {"volts": f"{u16le(payload, 0) / 1000:.3f}"}
     if len(payload) == 2:
-        return {"u16le": str(u16le(payload, 0)), "as_volts": f"{u16le(payload, 0) / 1000:.3f}"}
+        return {"u16le": str(u16le(payload, 0))}
     return {}
 
 
@@ -292,16 +303,25 @@ def summarize(presence: DebugResult, rom_steps: list[Step], steps: list[Step]) -
         return ["data line is LOW at idle: check wiring/pull-up, or the BMS is holding the bus"]
     if not presence.presence:
         return ["no presence pulse: likely no 1-Wire chip (or not on this contact/pin)"]
-    lines = []
-    good_rom = [s.name for s in rom_steps if s.decoded.get("crc") == "OK"]
-    if good_rom:
-        lines.append(f"valid 1-Wire ROM read at: {', '.join(good_rom)}")
-    else:
-        lines.append("chip answers reset but ROM CRC never matched: maybe not standard 1-Wire")
+    lines = [summarize_rom(rom_steps)]
     answered = [s.name for s in steps
                 if s.ok and "hint" not in s.decoded and not s.name.startswith("rom@")]
     lines.append(f"known commands with real data: {', '.join(answered) or 'none'}")
     return lines
+
+
+def summarize_rom(rom_steps: list[Step]) -> str:
+    """Judges the ROM by agreement across the timing sweep, since the CRC can't be trusted."""
+    readable = [s for s in rom_steps if s.ok and "hint" not in s.decoded]
+    if not readable:
+        return "chip answers reset but every ROM read was blank"
+    responses = Counter(s.response for s in readable)
+    best, count = responses.most_common(1)[0]
+    if count == len(rom_steps):
+        return f"ROM stable at every timing: {best}"
+    agreeing = [s.name for s in readable if s.response == best]
+    return (f"ROM unstable ({count}/{len(rom_steps)} agree on {best} at {', '.join(agreeing)}): "
+            "timing-sensitive or flaky contact")
 
 
 def compare(path_a: Path, path_b: Path) -> list[str]:
