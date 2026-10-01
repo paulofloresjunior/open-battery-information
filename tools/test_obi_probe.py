@@ -98,6 +98,20 @@ class DecodeTests(unittest.TestCase):
     def test_blank_rom_is_flagged(self):
         self.assertIn("hint", obi.decode_rom(b"\xFF" * 8))
 
+    def test_lxt_msg_decodes_real_dumps_like_web_ui(self):
+        # 40-byte lxt_msg payloads captured from the user's batteries (dumps/ on 2026-10-01).
+        bl1830 = bytes.fromhex(
+            "100B0D0200140157F126BD1314580000B1B14021D080020BC1D08E679F3E0021D1020ED000A00273")
+        bl1840b = bytes.fromhex(
+            "12041364050501C3F126BD1314580000C1C14021D080020B82D08E6760A3000102020EE000A004E1")
+        decoded_1830 = obi.decode_known("lxt_msg", bl1830)
+        decoded_1840b = obi.decode_known("lxt_msg", bl1840b)
+        self.assertEqual(decoded_1830["charge_count_if_lxt"], "13")
+        self.assertEqual(decoded_1830["lock_if_lxt"], "LOCKED")
+        self.assertEqual(decoded_1840b["charge_count_if_lxt"], "14")
+        self.assertEqual(decoded_1840b["capacity_if_lxt"], "4.0Ah")
+        self.assertEqual(decoded_1840b["lock_if_lxt"], "UNLOCKED")
+
     def test_f0513_temperature_in_celsius(self):
         self.assertEqual(obi.decode_known("f0513_temp", bytes.fromhex("CE0B")), {"temp_c": "30.22"})
 

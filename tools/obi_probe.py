@@ -223,6 +223,9 @@ def decode_known(name: str, payload: bytes) -> dict[str, str]:
         decoded = decode_rom(payload[:8])
         decoded.update({
             "capacity_if_lxt": f"{nibble_swap(payload[24]) / 10:.1f}Ah",
+            # Same formula as the web UI, which marks the value "Charge count*" (unverified).
+            "charge_count_if_lxt": str(
+                ((nibble_swap(payload[34]) << 8) | nibble_swap(payload[35])) & 0x0FFF),
             "lock_if_lxt": "LOCKED" if payload[28] & 0x0F else "UNLOCKED",
             "status_if_lxt": f"0x{payload[27]:02X}",
         })
