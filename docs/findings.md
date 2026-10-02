@@ -4,7 +4,7 @@ Observations from real batteries read with `tools/obi_probe.py` on an Arduino Na
 the `0xD0` debug command). Raw dumps are JSON files in `dumps/` (gitignored); the relevant bytes are
 copied below so this file stands on its own.
 
-Sample size is small (8 packs, 6 with a chip). Anything marked **hypothesis** is a pattern that fits
+Sample size is small (9 packs, 7 with a chip). Anything marked **hypothesis** is a pattern that fits
 every pack seen so far, not a confirmed meaning.
 
 ## Byte numbering
@@ -21,6 +21,7 @@ Offsets are into the **payload**, i.e. the firmware response without its 2-byte 
 | Pack | Chip | Made | Cycles | Lock | Cells (V) | Notes |
 |---|---|---|---|---|---|---|
 | BL1460B 14.4V 6.0Ah | LXT | 29/10/2022 | 3 | unlocked | 4.065 4.065 4.067 4.068 | owner's, ~2 charges remembered; healthy |
+| BL1850B 18V 5.0Ah | LXT | 30/11/2021 | 10 | unlocked | 4.009 4.003 4.011 4.009 4.003 | was locked, unlocked before this read; healthy |
 | BL1840B 18V 4.0Ah | LXT | 19/04/2018 | 14 | unlocked | 4.027 4.034 3.666 3.666 3.666 | 0.37 V imbalance |
 | BL1830 18V | F0513 | 13/11/2016 | 13 | **locked** | 3.812 3.808 3.808 0.769 0.801 | cells via F0513 commands; stored long |
 | BL1815N #1 18V 1.5Ah | LXT | 15/07/2019 | 7 | **locked** | 0.856 0.000 3.987 3.978 3.737 | cell 2 dead or sense wire open |
@@ -36,6 +37,7 @@ rig problem. They have no data chip on the contact wired to the Nano.
 
 ```
 BL1460B     16 0A 1D 64 1E 08 01 57
+BL1850B     15 0B 1E 64 14 0A 06 10
 BL1840B     12 04 13 64 05 05 01 C3
 BL1830      10 0B 0D 02 00 14 01 57
 BL1815N #1  13 07 0F 64 32 03 88 F3
@@ -59,6 +61,7 @@ First byte shown is payload 8; each row is 32 bytes (payload 8–39).
 
 ```
 BL1460B     E1 43 30 84 1B 58 00 00 94 94 40 41 D0 70 02 0E C3 A0 8E 67 E0 C7 00 03 F1 02 0E 30 00 30 00 63
+BL1850B     F1 26 BD 13 14 58 00 00 94 94 40 21 D0 80 02 0E 23 D0 8E 45 60 16 00 03 02 02 0E A0 00 50 02 33
 BL1840B     F1 26 BD 13 14 58 00 00 C1 C1 40 21 D0 80 02 0B 82 D0 8E 67 60 A3 00 01 02 02 0E E0 00 A0 04 E1
 BL1830      F1 26 BD 13 14 58 00 00 B1 B1 40 21 D0 80 02 0B C1 D0 8E 67 9F 3E 00 21 D1 02 0E D0 00 A0 02 73
 BL1815N #1  41 43 CB 95 1A 68 00 00 C1 C1 40 41 01 E0 02 03 F0 D0 8E BE 5F 58 00 21 C1 02 0E 70 00 30 02 93
@@ -68,10 +71,10 @@ BL1815N #3  41 43 CB 95 1A 68 00 00 C1 C1 40 41 01 E0 02 03 F0 D0 8E BE 5F 58 00
 
 | Payload | Meaning | Confidence |
 |---|---|---|
-| 8–13 | identical across the three BL1815N; BL1830 and BL1840B share another value | **hypothesis:** model/family constant |
-| 24 | capacity, nibble-swapped, in 0.1 Ah (`F0`→1.5, `82`→4.0, `C3`→6.0) | confirmed on LXT packs; BL1830 decodes to 2.8 Ah (see open questions) |
-| 27 | `0x67` on BL1830/BL1840B/BL1460B, `0xBE` on all BL1815N, locked or not | **does not track lock or faults.** The web UI labels it "Status code", but it follows the model |
-| 28 low nibble | `F` = locked, `0` = unlocked | matches all 6 packs (same rule the web UI uses) |
+| 8–13 | identical across the three BL1815N; BL1830, BL1840B and BL1850B share another value | **hypothesis:** model/family constant |
+| 24 | capacity, nibble-swapped, in 0.1 Ah (`F0`→1.5, `82`→4.0, `23`→5.0, `C3`→6.0) | confirmed on LXT packs; BL1830 decodes to 2.8 Ah (see open questions) |
+| 27 | `0x67` on BL1830/BL1840B/BL1460B, `0xBE` on all BL1815N (locked or not), `0x45` on the unlocked BL1850B | **unknown.** It doesn't track the lock nibble, but it isn't a pure model constant either (BL1840B ≠ BL1850B). The unlock may have rewritten it |
+| 28 low nibble | `F` = locked, `0` = unlocked | matches all 7 packs (same rule the web UI uses) |
 | 28–29 | `5F 58` on both locked BL1815N despite different faults; `9F 3E` on locked BL1830 | **hypothesis:** lock-reason record |
 | 34–35 | charge count: nibble-swap both, big-endian, low 12 bits | plausible: 3 on a pack the owner charged ~2–3 times |
 
@@ -97,6 +100,8 @@ from the per-cell commands `CC 31`..`CC 35` and `CC 52` instead.
 
 - BL1830 capacity decodes to 2.8 Ah, though the model is sold as 3.0 Ah. Either the F0513 message
   layout differs, or byte 24 holds a rated/measured value rather than the label capacity.
+- Byte 27: dump a locked pack, unlock it, dump again. A before/after diff of the same pack would
+  show what the unlock writes.
 - Meaning of payload 28–29 beyond the lock nibble: more locked packs with known faults are needed.
 - `lxt_data` bytes 12–13 (`20 05` on all BL1815N, `2C 05` BL1840B, `48 18` BL1460B) and 18–28.
 - Whether non-star packs (BL1415, clone) carry anything on other contacts of the yellow terminal block.
