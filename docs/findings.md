@@ -73,10 +73,25 @@ BL1815N #3  41 43 CB 95 1A 68 00 00 C1 C1 40 41 01 E0 02 03 F0 D0 8E BE 5F 58 00
 |---|---|---|
 | 8–13 | identical across the three BL1815N; BL1830, BL1840B and BL1850B share another value | **hypothesis:** model/family constant |
 | 24 | capacity, nibble-swapped, in 0.1 Ah (`F0`→1.5, `82`→4.0, `23`→5.0, `C3`→6.0) | confirmed on LXT packs; BL1830 decodes to 2.8 Ah (see open questions) |
-| 27 | `0x67` on BL1830/BL1840B/BL1460B, `0xBE` on all BL1815N (locked or not), `0x45` on the unlocked BL1850B | **unknown.** It doesn't track the lock nibble, but it isn't a pure model constant either (BL1840B ≠ BL1850B). The unlock may have rewritten it |
+| 16–17 | always a repeated pair (`C1 C1`, `94 94`…); **rewritten by Clear errors** (`C1 C1` → `74 74`) | unknown; not a sum/XOR/nibble-sum checksum of the message |
+| 27 | `0x67` on BL1830/BL1840B/BL1460B, `0xBE` on all BL1815N, `0x45` on BL1850B | **not touched by Clear errors** (before/after, below), so not the lock status. Per-pack/per-model value of unknown meaning |
 | 28 low nibble | `F` = locked, `0` = unlocked | matches all 7 packs (same rule the web UI uses) |
-| 28–29 | `5F 58` on both locked BL1815N despite different faults; `9F 3E` on locked BL1830 | **hypothesis:** lock-reason record |
+| 28–29 | locked: `5F 58` (both locked BL1815N), `9F 3E` (BL1830). Clear errors turned `5F 58` into `A0 B3` | **hypothesis:** lock record. Byte 28 after unlock is the bitwise NOT of before (`5F` → `A0`); `~9F` = `60`, the value on unlocked BL1840B/BL1850B. Byte 29 does not follow that rule |
 | 34–35 | charge count: nibble-swap both, big-endian, low 12 bits | plausible: 3 on a pack the owner charged ~2–3 times |
+
+## Before/after Clear errors (BL1815N #1)
+
+Same pack read, unlocked with the web UI "Clear errors" (`33 D9 96 A5`, `33 DA 04`), read again
+about 2 minutes later. Only 4 message bytes changed:
+
+| Payload | Before | After |
+|---|---|---|
+| 16–17 | `C1 C1` | `74 74` |
+| 28–29 | `5F 58` | `A0 B3` |
+
+Everything else, including byte 27 (`BE`) and the charge count, stayed the same. The pack has a
+cell at 0 V and cell 1 dropped 0.856 → 0.837 → 0.783 V over ~35 min at rest (self-discharging),
+so the lock was justified. Unlocking only clears the flag; it does not fix the cause.
 
 ## Live data (`lxt_data`, LXT chip only)
 
@@ -100,8 +115,8 @@ from the per-cell commands `CC 31`..`CC 35` and `CC 52` instead.
 
 - BL1830 capacity decodes to 2.8 Ah, though the model is sold as 3.0 Ah. Either the F0513 message
   layout differs, or byte 24 holds a rated/measured value rather than the label capacity.
-- Byte 27: dump a locked pack, unlock it, dump again. A before/after diff of the same pack would
-  show what the unlock writes.
+- Byte 27: unlock doesn't write it (answered by the before/after above), but its meaning is open.
+- Bytes 16–17: what the unlock writes there, and why the value differs per pack (`74` vs `94`).
 - Meaning of payload 28–29 beyond the lock nibble: more locked packs with known faults are needed.
 - `lxt_data` bytes 12–13 (`20 05` on all BL1815N, `2C 05` BL1840B, `48 18` BL1460B) and 18–28.
 - Whether non-star packs (BL1415, clone) carry anything on other contacts of the yellow terminal block.
