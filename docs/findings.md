@@ -21,7 +21,7 @@ Offsets are into the **payload**, i.e. the firmware response without its 2-byte 
 | Pack | Chip | Made | Cycles | Lock | Cells (V) | Notes |
 |---|---|---|---|---|---|---|
 | BL1460B 14.4V 6.0Ah | LXT | 29/10/2022 | 3 | unlocked | 4.065 4.065 4.067 4.068 | owner's, ~2 charges remembered; healthy |
-| BL1850B 18V 5.0Ah | LXT | 30/11/2021 | 10 | unlocked | 4.009 4.003 4.011 4.009 4.003 | was locked, unlocked before this read; healthy |
+| BL1850B 18V 5.0Ah | LXT | 30/11/2021 | 10 | unlocked | 4.009 4.003 4.011 4.009 4.003 | was locked, unlocked with the web UI "Clear errors" (`33 D9 96 A5` then `33 DA 04`); no pre-unlock dump; healthy |
 | BL1840B 18V 4.0Ah | LXT | 19/04/2018 | 14 | unlocked | 4.027 4.034 3.666 3.666 3.666 | 0.37 V imbalance |
 | BL1830 18V | F0513 | 13/11/2016 | 13 | **locked** | 3.812 3.808 3.808 0.769 0.801 | cells via F0513 commands; stored long |
 | BL1815N #1 18V 1.5Ah | LXT | 15/07/2019 | 7 | **locked** | 0.856 0.000 3.987 3.978 3.737 | cell 2 dead or sense wire open |
