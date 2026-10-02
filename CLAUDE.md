@@ -26,7 +26,10 @@ is an Arduino Nano clone (CH340) with the **old** bootloader → use env `nano`,
 
 Python host tool for reverse-engineering batteries the web UI can't read. It replays the web UI's
 read commands (copied from `js/modules/makita_lxt.js` in the web UI repo), uses `0xD0` for
-presence/ROM CRC/timing sweeps, and saves JSON dumps to `dumps/` (gitignored).
+presence/ROM consistency/timing sweeps, and saves JSON dumps to `dumps/` (gitignored). The ROM ID
+identifies a physical pack, so `probe` looks up earlier dumps of the same pack and prints what
+changed. Diffs re-decode from raw bytes, because older dumps stored different decoded keys.
+Byte meanings found so far live in `docs/findings.md`.
 
 ```bash
 .venv/Scripts/python tools/obi_probe.py probe --port COM9 --label BL1415

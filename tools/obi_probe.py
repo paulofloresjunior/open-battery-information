@@ -327,24 +327,96 @@ def summarize_rom(rom_steps: list[Step]) -> str:
             "timing-sensitive or flaky contact")
 
 
-def compare(path_a: Path, path_b: Path) -> list[str]:
-    def responses(path: Path) -> dict[str, str]:
-        report = json.loads(path.read_text(encoding="utf-8"))
-        return {s["name"]: s["response"] or f"<{s['error']}>" for s in report["steps"]}
+def load_report(path: Path) -> dict[str, object]:
+    return json.loads(path.read_text(encoding="utf-8"))
 
-    left, right = responses(path_a), responses(path_b)
+
+def rom_of(report: dict[str, object]) -> str | None:
+    """The pack's ROM ID, which identifies a physical battery (bytes 6-7 act as a serial).
+
+    Taken from lxt_msg rather than the rom@ steps so dumps saved before this existed also match.
+    """
+    for step in report.get("steps", []):
+        if step["name"] != "lxt_msg" or not step["response"]:
+            continue
+        rom = bytes.fromhex(step["response"])[:8]
+        return None if is_blank(rom) else hex_dump(rom)
+    return None
+
+
+def find_previous_reads(rom: str, dumps_dir: Path) -> list[tuple[Path, dict[str, object]]]:
+    """Dumps of the same pack, oldest first."""
+    matches = []
+    for path in dumps_dir.glob("*.json"):
+        report = load_report(path)
+        if rom_of(report) == rom:
+            matches.append((path, report))
+    return sorted(matches, key=lambda match: str(match[1].get("timestamp", "")))
+
+
+# Byte-level diffs only where the bytes are stored state; live data (voltages, temperatures)
+# changes on every read, so for those only the decoded values are compared.
+BYTE_DIFF_STEPS = ("lxt_msg",)
+
+
+def redecode(name: str, step: dict[str, object]) -> dict[str, str]:
+    if not step["response"]:
+        return {"error": str(step["error"])}
+    return decode_known(name, bytes.fromhex(str(step["response"])))
+
+
+def diff_reports(old: dict[str, object], new: dict[str, object]) -> list[str]:
+    old_steps = {s["name"]: s for s in old["steps"] if not s["name"].startswith("rom@")}
+    new_steps = {s["name"]: s for s in new["steps"] if not s["name"].startswith("rom@")}
     lines = []
-    for name in sorted(set(left) | set(right)):
-        a, b = left.get(name, "<missing>"), right.get(name, "<missing>")
-        marker = "  " if a == b else "!="
-        lines.append(f"{marker} {name}\n     A: {a}\n     B: {b}")
-    return lines
+    for name in old_steps.keys() & new_steps.keys():
+        before, after = old_steps[name], new_steps[name]
+        if name in BYTE_DIFF_STEPS and before["response"] and after["response"]:
+            old_bytes, new_bytes = bytes.fromhex(before["response"]), bytes.fromhex(after["response"])
+            for offset, (a, b) in enumerate(zip(old_bytes, new_bytes)):
+                if a != b:
+                    lines.append(f"{name}[{offset}]: {a:02X} -> {b:02X}")
+        # Re-decoded from raw bytes: dumps from older tool versions stored other decoded keys.
+        old_decoded, new_decoded = redecode(name, before), redecode(name, after)
+        for key in old_decoded.keys() | new_decoded.keys():
+            a, b = old_decoded.get(key, "-"), new_decoded.get(key, "-")
+            if a != b:
+                lines.append(f"{name}.{key}: {a} -> {b}")
+    return sorted(lines)
+
+
+def compare(path_a: Path, path_b: Path) -> list[str]:
+    return diff_reports(load_report(path_a), load_report(path_b)) or ["no differences"]
+
+
+def report_history(report: dict[str, object], dumps_dir: Path, log: Callable[[str], None]) -> None:
+    rom = rom_of(report)
+    if rom is None:
+        return
+    previous = find_previous_reads(rom, dumps_dir)
+    if not previous:
+        log(f">> first read of this pack (ROM {rom})")
+        return
+    labels = ", ".join(f"{p['label']} @ {p['timestamp']}" for _, p in previous)
+    log(f">> pack seen {len(previous)}x before (ROM {rom}): {labels}")
+    last_path, last = previous[-1]
+    changes = diff_reports(last, report)
+    if not changes:
+        log(f">> no changes since {last_path.name}")
+        return
+    log(f">> changes since {last_path.name}:")
+    for line in changes:
+        log(f"     {line}")
 
 
 def open_link(port_name: str) -> tuple[ObiLink, SerialPort]:
     import serial  # imported lazily so tests and `compare` don't need pyserial
 
-    port = serial.Serial(port_name, BAUD_RATE, timeout=0.2)
+    try:
+        port = serial.Serial(port_name, BAUD_RATE, timeout=0.2)
+    except serial.SerialException as exc:
+        raise ObiError(f"could not open {port_name} ({exc}); if access is denied, another program "
+                       "(OBI-1 web UI, serial monitor) has it open: disconnect it and retry") from exc
     time.sleep(BOOT_WAIT_S)
     return ObiLink(port), port
 
@@ -397,7 +469,11 @@ def main(argv: list[str] | None = None) -> int:
         if input().strip().lower() != "y":
             return 1
 
-    link, port = open_link(args.port)
+    try:
+        link, port = open_link(args.port)
+    except ObiError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     try:
         if args.command == "raw":
             if args.read > MAX_RSP_LEN - 2:
@@ -411,6 +487,8 @@ def main(argv: list[str] | None = None) -> int:
         report = probe(link, print)
         report["label"] = args.label
         DUMPS_DIR.mkdir(exist_ok=True)
+        # Before saving, so the new dump isn't compared with itself.
+        report_history(report, DUMPS_DIR, print)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         out = DUMPS_DIR / f"{args.label}_{stamp}.json"
         out.write_text(json.dumps(report, indent=2), encoding="utf-8")

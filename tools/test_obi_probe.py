@@ -151,15 +151,72 @@ class ProbeTests(unittest.TestCase):
         steps = [rom_step("rom@60us", b"\xFF" * 8)]
         self.assertIn("blank", obi.summarize_rom(steps))
 
-    def test_compare_marks_differences(self):
-        def dump(response: str) -> dict[str, object]:
-            return {"steps": [{"name": "lxt_msg", "response": response, "error": ""}]}
 
+
+# BL1815N #1 before and after the web UI "Clear errors" (dumps/ on 2026-10-01).
+BL1815N_LOCKED_MSG = ("13 07 0F 64 32 03 88 F3 41 43 CB 95 1A 68 00 00 C1 C1 40 41 01 E0 02 03 "
+                      "F0 D0 8E BE 5F 58 00 21 C1 02 0E 70 00 30 02 93")
+BL1815N_UNLOCKED_MSG = ("13 07 0F 64 32 03 88 F3 41 43 CB 95 1A 68 00 00 74 74 40 41 01 E0 02 03 "
+                        "F0 D0 8E BE A0 B3 00 21 C1 02 0E 70 00 30 02 93")
+
+
+def dump(msg: str, label: str = "pack", timestamp: str = "2026-10-01T00:00:00",
+         decoded: dict[str, str] | None = None) -> dict[str, object]:
+    return {"label": label, "timestamp": timestamp, "steps": [
+        {"name": "lxt_msg", "response": msg, "error": "", "decoded": decoded or {}}]}
+
+
+class HistoryTests(unittest.TestCase):
+    def test_rom_of_reads_rom_from_lxt_msg(self):
+        self.assertEqual(obi.rom_of(dump(BL1815N_LOCKED_MSG)), "13 07 0F 64 32 03 88 F3")
+
+    def test_rom_of_silent_pack_is_none(self):
+        self.assertIsNone(obi.rom_of(dump(" ".join(["FF"] * 40))))
+
+    def test_unlock_diff_shows_bytes_and_decoded_lock(self):
+        changes = obi.diff_reports(dump(BL1815N_LOCKED_MSG), dump(BL1815N_UNLOCKED_MSG))
+        self.assertEqual(changes, [
+            "lxt_msg.lock_if_lxt: LOCKED -> UNLOCKED",
+            "lxt_msg[16]: C1 -> 74",
+            "lxt_msg[17]: C1 -> 74",
+            "lxt_msg[28]: 5F -> A0",
+            "lxt_msg[29]: 58 -> B3",
+        ])
+
+    def test_stale_decoded_keys_from_old_dumps_are_ignored(self):
+        old = dump(BL1815N_LOCKED_MSG, decoded={"crc": "FAIL (calc 0x61, got 0x57)"})
+        self.assertEqual(obi.diff_reports(old, dump(BL1815N_LOCKED_MSG)), [])
+
+    def test_history_finds_same_pack_only_oldest_first(self):
+        other_pack = BL1815N_LOCKED_MSG.replace("88 F3", "01 51", 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, report in {
+                "late.json": dump(BL1815N_UNLOCKED_MSG, "late", "2026-10-01T22:00:00"),
+                "early.json": dump(BL1815N_LOCKED_MSG, "early", "2026-10-01T21:00:00"),
+                "other.json": dump(other_pack, "other"),
+            }.items():
+                Path(tmp, name).write_text(json.dumps(report), encoding="utf-8")
+
+            previous = obi.find_previous_reads("13 07 0F 64 32 03 88 F3", Path(tmp))
+            self.assertEqual([p.name for p, _ in previous], ["early.json", "late.json"])
+
+            log: list[str] = []
+            obi.report_history(dump(BL1815N_UNLOCKED_MSG), Path(tmp), log.append)
+            self.assertIn("seen 2x before", log[0])
+            self.assertIn("no changes since late.json", log[1])
+
+    def test_history_first_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            obi.report_history(dump(BL1815N_LOCKED_MSG), Path(tmp), log.append)
+            self.assertIn("first read", log[0])
+
+    def test_compare_identical_dumps(self):
         with tempfile.TemporaryDirectory() as tmp:
             a, b = Path(tmp, "a.json"), Path(tmp, "b.json")
-            a.write_text(json.dumps(dump("01 02")), encoding="utf-8")
-            b.write_text(json.dumps(dump("01 03")), encoding="utf-8")
-            self.assertTrue(obi.compare(a, b)[0].startswith("!="))
+            a.write_text(json.dumps(dump(BL1815N_LOCKED_MSG)), encoding="utf-8")
+            b.write_text(json.dumps(dump(BL1815N_LOCKED_MSG)), encoding="utf-8")
+            self.assertEqual(obi.compare(a, b), ["no differences"])
 
 
 if __name__ == "__main__":
