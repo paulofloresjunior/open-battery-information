@@ -83,7 +83,11 @@ BL1815N #3  41 43 CB 95 1A 68 00 00 C1 C1 40 41 01 E0 02 03 F0 D0 8E BE 5F 58 00
 | 27 | `0x67` on BL1830/BL1840B/BL1460B, `0xBE` on all BL1815N, `0x45` on BL1850B | **not touched by Clear errors** (before/after, below), so not the lock status. Per-pack/per-model value of unknown meaning |
 | 28 low nibble | `F` = locked, `0` = unlocked | matches all 7 packs (same rule the web UI uses) |
 | 28–29 | locked: `5F 58` (both locked BL1815N), `9F 3E` (BL1830). Clear errors turned `5F 58` into `A0 B3` | **hypothesis:** lock record. Byte 28 after unlock is the bitwise NOT of before (`5F` → `A0`); `~9F` = `60`, the value on unlocked BL1840B/BL1850B. Byte 29 does not follow that rule |
-| 34–35 | charge count: nibble-swap both, big-endian, low 12 bits | plausible: 3 on a pack the owner charged ~2–3 times. Charging cells directly (bypassing the BMS) does not increment it |
+| 31 | `01`, `03`, `21`, `63` seen; went `01` → `03` on BL1840B #1 after a full discharge + full charge | unknown, possibly flags |
+| 34–35 | charge count: nibble-swap both, big-endian, low 12 bits | **confirmed:** went 14 → 15 after one full charge through the BMS; 3 on a pack the owner charged ~2–3 times. Charging cells directly (bypassing the BMS) does not increment it |
+| 36–37 | second counter, same encoding as 34–35 (`00 A0` = 10, `00 B0` = 11) | **hypothesis:** full-charge count. Always ≤ charge count on all 8 chip packs (3/3, 11/15, 5/10, 126/132…); went 10 → 11 together with the charge count on a full discharge + full charge |
+| 38 | `00`–`05`; went `04` → `05` after a full discharge | **weak hypothesis:** discharge-to-cutoff count. `00` on the owner's never-drained BL1460B, but also `00` on the 0 V BL1815N #2/#3 (maybe drained in storage with the BMS asleep) |
+| 39 | changes with the counters (`E1` → `13`), but not when Clear errors rewrote 16–17/28–29 | unknown; not a sum/XOR of any suffix of the payload |
 
 ## Before/after Clear errors (BL1815N #1)
 
@@ -98,6 +102,13 @@ about 2 minutes later. Only 4 message bytes changed:
 Everything else, including byte 27 (`BE`) and the charge count, stayed the same. The pack has a
 cell at 0 V and cell 1 dropped 0.856 → 0.837 → 0.783 V over ~35 min at rest (self-discharging),
 so the lock was justified. Unlocking only clears the flag; it does not fix the cause.
+
+## Full discharge + full charge (BL1840B #1)
+
+After the per-cell recovery, the owner fully discharged the pack in use and fully charged it
+on the Makita charger. Cells went to 4.087 4.086 4.080 4.080 4.081 (7 mV spread), so the recovery
+held. Message bytes that changed: 31 `01`→`03`, 35 `E0`→`F0` (charge count 14→15), 37 `A0`→`B0`
+(second counter 10→11), 38 `04`→`05`, 39 `E1`→`13`.
 
 ## Live data (`lxt_data`, LXT chip only)
 
