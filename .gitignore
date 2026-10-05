@@ -1,1 +1,4 @@
 .pio/
+.venv/
+dumps/
+__pycache__/
