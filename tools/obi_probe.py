@@ -5,12 +5,15 @@ uses (js/modules/makita_lxt.js in openbatteryinformation.github.io) plus a few l
 diagnostics, and saves everything as JSON so dumps from a working battery and an unknown
 one can be compared byte by byte.
 
-Read-only by default: commands that change the battery state (test mode, LEDs, clear
-errors) are deliberately absent. `raw` sends arbitrary bytes and asks for confirmation.
+Read-only by default: commands that change the battery state (LEDs, clear errors, frame
+writes) are deliberately absent. `probe --testmode` enters and leaves the BMS test mode to
+read memory that may only answer there, and asks for confirmation; `raw` sends arbitrary
+bytes and asks too.
 
 Usage:
     python tools/obi_probe.py ports
     python tools/obi_probe.py probe --port COM9 --label BL1415
+    python tools/obi_probe.py probe --port COM9 --label BL1840B --testmode
     python tools/obi_probe.py raw --port COM9 --write 33 --read 8
     python tools/obi_probe.py compare dumps/a.json dumps/b.json
 """
@@ -36,6 +39,7 @@ RESPONSE_TIMEOUT_S = 3.0
 FRAME_START = 0x01
 CMD_VERSION = 0x01
 CMD_DEBUG_RAW = 0xD0
+CMD_SESSION = 0xD1
 DEBUG_FLAG_RESET = 0x01
 # The firmware's rsp buffer is 255 bytes, 2 of them are the response header.
 MAX_RSP_LEN = 253
@@ -97,21 +101,38 @@ class DebugResult:
     read: bytes
 
 
+@dataclass(frozen=True)
+class Transaction:
+    """One 1-Wire exchange inside a session (cmd 0xD1), where ENABLE stays high throughout."""
+    write: bytes
+    read_len: int
+    reset: bool = True
+    delay_ms: int = 0
+
+
+@dataclass
+class TransactionReply:
+    presence: int | None  # None when the reset was skipped
+    read: bytes
+
+
 class ObiLink:
     def __init__(self, port: SerialPort, timeout_s: float = RESPONSE_TIMEOUT_S):
         self._port = port
         self._timeout_s = timeout_s
 
-    def request(self, cmd: int, data: bytes, rsp_len: int) -> bytes:
+    def request(self, cmd: int, data: bytes, rsp_len: int,
+                timeout_s: float | None = None) -> bytes:
         """Sends one frame and returns the payload (without the cmd/len header)."""
+        timeout_s = self._timeout_s if timeout_s is None else timeout_s
         self._port.reset_input_buffer()
         self._port.write(build_frame(cmd, data, rsp_len))
-        header = self._read_exact(2)
+        header = self._read_exact(2, timeout_s)
         if len(header) < 2:
-            raise ObiError(f"no response to cmd 0x{cmd:02X} within {self._timeout_s}s")
+            raise ObiError(f"no response to cmd 0x{cmd:02X} within {timeout_s}s")
         if header[0] != cmd:
             raise ObiError(f"response echoes cmd 0x{header[0]:02X}; expected 0x{cmd:02X}")
-        payload = self._read_exact(header[1])
+        payload = self._read_exact(header[1], timeout_s)
         if len(payload) != header[1]:
             raise ObiError(f"cmd 0x{cmd:02X}: got {len(payload)} of {header[1]} payload bytes")
         return payload
@@ -145,8 +166,42 @@ class ObiLink:
         presence = None if payload[1] == 0xFF else payload[1]
         return DebugResult(idle_level=payload[0], presence=presence, read=payload[2:])
 
-    def _read_exact(self, size: int) -> bytes:
-        deadline = time.monotonic() + self._timeout_s
+    def session(self, transactions: list[Transaction]) -> list[TransactionReply]:
+        """Runs transactions back to back without dropping ENABLE between them.
+
+        Every other command powers the BMS down when it answers, which also leaves test mode,
+        so reads that only answer in test mode have to share one session with the entry.
+        """
+        data = b""
+        for t in transactions:
+            if not 0 <= t.delay_ms <= 255:
+                raise ObiError(f"delay_ms={t.delay_ms}; expected 0..255")
+            if not 0 <= t.read_len <= 255 or len(t.write) > 255:
+                raise ObiError(f"transaction writes {len(t.write)} and reads {t.read_len} bytes; "
+                               "expected at most 255 each")
+            data += bytes([DEBUG_FLAG_RESET if t.reset else 0, t.delay_ms,
+                           len(t.write), t.read_len]) + t.write
+        rsp_len = sum(1 + t.read_len for t in transactions)
+        # The firmware answers only after running every delay.
+        timeout_s = self._timeout_s + sum(t.delay_ms for t in transactions) / 1000
+        payload = self.request(CMD_SESSION, data, rsp_len, timeout_s)
+        if len(payload) == 0:
+            raise ObiError(
+                "firmware rejected cmd 0xD1 (session): either it predates the command (flash the "
+                "firmware from branch feature/debug-probe) or the request was malformed"
+            )
+        if len(payload) != rsp_len:
+            raise ObiError(f"session returned {len(payload)} bytes; expected {rsp_len}")
+        replies = []
+        offset = 0
+        for t in transactions:
+            presence = None if payload[offset] == 0xFF else payload[offset]
+            replies.append(TransactionReply(presence, payload[offset + 1:offset + 1 + t.read_len]))
+            offset += 1 + t.read_len
+        return replies
+
+    def _read_exact(self, size: int, timeout_s: float) -> bytes:
+        deadline = time.monotonic() + timeout_s
         received = b""
         while len(received) < size and time.monotonic() < deadline:
             received += self._port.read(size - len(received))
@@ -180,8 +235,43 @@ KNOWN_READS: tuple[KnownRead, ...] = (
     KnownRead("f0513_vcell3", 0xCC, bytes([0x33]), 0x02, "F0513 cell 3 mV (u16le)"),
     KnownRead("f0513_vcell4", 0xCC, bytes([0x34]), 0x02, "F0513 cell 4 mV (u16le)"),
     KnownRead("f0513_vcell5", 0xCC, bytes([0x35]), 0x02, "F0513 cell 5 mV (u16le)"),
-    KnownRead("f0513_temp", 0xCC, bytes([0x52]), 0x02, "F0513 temperature, 1/100 C (u16le)"),
+    KnownRead("f0513_temp", 0xCC, bytes([0x52]), 0x02, "F0513 temperature, 1/10 K (u16le)"),
 )
+
+# Memory reads (`cmd addr_lo addr_hi len`) that other projects use; the web UI doesn't send
+# them. The reply is `len` bytes plus a 0x06 ACK. synrais reads them outside test mode and
+# checks the ACK; PackScope says the ACK only comes in test mode, so `--testmode` repeats
+# them in there to settle it. Sources and confidence for each meaning: docs/findings.md.
+MEMORY_READS: tuple[KnownRead, ...] = (
+    KnownRead("type0_id", 0xCC, bytes([0xDC, 0x0B]), 17,
+              "synrais: last byte 0x06 = LXT 'type 0' BMS"),
+    KnownRead("type3_id", 0xCC, bytes([0xD4, 0x2C, 0x00, 0x02]), 3,
+              "synrais: last byte 0x06 = 'type 3' BMS"),
+    KnownRead("d4_assembly_date", 0xCC, bytes([0xD4, 0x00, 0x00, 0x03]), 4,
+              "PocketOBI: assembly date YY MM DD (binary)"),
+    KnownRead("d4_0150", 0xCC, bytes([0xD4, 0x50, 0x01, 0x02]), 3,
+              "u16le; PocketOBI: state of charge, synrais: health (raw / capacity code)"),
+    KnownRead("d4_od_events", 0xCC, bytes([0xD4, 0xBA, 0x00, 0x01]), 2,
+              "over-discharge event count"),
+    KnownRead("d4_overload", 0xCC, bytes([0xD4, 0x8D, 0x00, 0x07]), 8,
+              "three packed overload counters"),
+    KnownRead("d7_charge_level", 0xCC, bytes([0xD7, 0x19, 0x00, 0x04]), 5,
+              "synrais: u32le coulomb counter"),
+    KnownRead("d7_current", 0xCC, bytes([0xD7, 0x61, 0x03, 0x02]), 3,
+              "synrais: average current (32768 - raw) / 100 A, unverified"),
+    KnownRead("lxt_data_ext", 0xCC, bytes([0xD7, 0x00, 0x00, 0xFF]), 0x70,
+              "lxt_data up to 0x6F: target capacity, error status and counters"),
+)
+# Not repeated in test mode: it already answers outside it (it's the web UI's lxt_data).
+TESTMODE_SKIP = ("lxt_data_ext",)
+
+TESTMODE_ENTER = bytes([0xCC, 0xD9, 0x96, 0xA5])
+TESTMODE_EXIT = bytes([0xCC, 0xD9, 0xFF, 0xFF])
+# Settle times from PocketOBI (20 ms after entry) and synrais (30 ms between commands).
+TESTMODE_SETTLE_MS = 20
+TESTMODE_GAP_MS = 30
+TESTMODE_PREFIX = "tm_"
+ACK = 0x06
 
 INTER_BYTE_SWEEP_US = (60, 90, 120, 180, 250)
 
@@ -213,34 +303,201 @@ def decode_rom(rom: bytes) -> dict[str, str]:
     }
 
 
+# --- LXT message: the 32 bytes after the ROM in lxt_msg -----------------------------------
+# Layout from rosvall/makita-lxt-protocol, synrais and TheRepairforge, checked against our own
+# dumps (docs/findings.md). Nybble n lives in message byte n // 2; even n is the low nibble.
+MSG_OFFSET = 8
+MSG_LEN = 32
+
+
+def msg_nybble(msg: bytes, n: int) -> int:
+    byte = msg[n >> 1]
+    return byte >> 4 if n & 1 else byte & 0x0F
+
+
+@dataclass(frozen=True)
+class Checksum:
+    name: str
+    first: int  # nybble range covered, inclusive
+    last: int
+    stored_at: int  # nybble holding the checksum
+    primary: bool  # the BMS writes the primary ones inverted when it locks the pack
+
+
+MSG_CHECKSUMS = (
+    Checksum("CS0", 0, 15, 41, primary=True),
+    Checksum("CS1", 16, 31, 42, primary=True),
+    Checksum("CS2", 32, 40, 43, primary=True),
+    Checksum("AUX0", 44, 47, 62, primary=False),
+    Checksum("AUX1", 48, 61, 63, primary=False),
+)
+PRIMARY_CHECKSUMS = sum(1 for c in MSG_CHECKSUMS if c.primary)
+NYBBLE_CHARGER_LOCK = 34
+NYBBLE_FAILURE_CODE = 40
+NYBBLE_DAMAGE_RATING = 46
+NYBBLE_CHARGE_COUNT = 52
+NYBBLE_SECOND_COUNTER = 56
+
+
+def checksum_calc(msg: bytes, checksum: Checksum) -> int:
+    return sum(msg_nybble(msg, n) for n in range(checksum.first, checksum.last + 1)) & 0x0F
+
+
+def checksum_mismatches(msg: bytes) -> list[tuple[Checksum, int, int]]:
+    """(checksum, stored, calculated) for every checksum that doesn't match."""
+    mismatches = []
+    for checksum in MSG_CHECKSUMS:
+        stored, calc = msg_nybble(msg, checksum.stored_at), checksum_calc(msg, checksum)
+        if stored != calc:
+            mismatches.append((checksum, stored, calc))
+    return mismatches
+
+
+def describe_checksums(msg: bytes) -> str:
+    mismatches = checksum_mismatches(msg)
+    if not mismatches:
+        return "all ok"
+    parts = []
+    for checksum, stored, calc in mismatches:
+        inverted = " (inverted)" if stored == calc ^ 0x0F else ""
+        parts.append(f"{checksum.name} {stored:X}, calc {calc:X}{inverted}")
+    return "; ".join(parts)
+
+
+def lock_cause(msg: bytes) -> str:
+    """Why a charger would refuse the pack, from every lock mechanism reported so far."""
+    causes = []
+    failure_code = msg_nybble(msg, NYBBLE_FAILURE_CODE)
+    if failure_code:
+        causes.append(f"failure code {failure_code}")
+    mismatches = checksum_mismatches(msg)
+    inverted = [c for c, stored, calc in mismatches if c.primary and stored == calc ^ 0x0F]
+    if len(inverted) == PRIMARY_CHECKSUMS and len(mismatches) == PRIMARY_CHECKSUMS:
+        causes.append("CS0-CS2 inverted (BMS lock; Clear errors undid it on BL1815N #1)")
+    elif mismatches:
+        causes.append(f"checksum mismatch: {describe_checksums(msg)}")
+    charger_lock = msg_nybble(msg, NYBBLE_CHARGER_LOCK)
+    if charger_lock:
+        causes.append(f"nybble 34 = {charger_lock} (synrais: chargers refuse when not 0)")
+    return "; ".join(causes) or "none"
+
+
+def decode_capacity(raw: int) -> str:
+    swapped = nibble_swap(raw)
+    # Newer packs reportedly store whole Ah (PocketOBI/PackScope); none of ours do.
+    if 1 <= raw <= 8 and swapped > 60:
+        return f"{raw:.1f}Ah"
+    return f"{swapped / 10:.1f}Ah"
+
+
+def decode_counter(msg: bytes, first_nybble: int) -> int:
+    """13-bit counter over 4 nybbles, most significant first; only bit 0 of the first is used."""
+    n = [msg_nybble(msg, first_nybble + i) for i in range(4)]
+    return ((n[0] & 0x1) << 12) | (n[1] << 8) | (n[2] << 4) | n[3]
+
+
+def clamp_pct(value: int) -> int:
+    return max(0, min(100, value))
+
+
+def decode_lxt_msg(payload: bytes) -> dict[str, str]:
+    msg = payload[MSG_OFFSET:MSG_OFFSET + MSG_LEN]
+    overdischarge = nibble_swap(msg[24])
+    overload = nibble_swap(msg[25])
+    failure_code = msg_nybble(msg, NYBBLE_FAILURE_CODE)
+    decoded = decode_rom(payload[:MSG_OFFSET])
+    decoded.update({
+        "capacity_if_lxt": decode_capacity(msg[16]),
+        "charge_count_if_lxt": str(decode_counter(msg, NYBBLE_CHARGE_COUNT)),
+        "second_counter": str(decode_counter(msg, NYBBLE_SECOND_COUNTER)),
+        "lock_if_lxt": "LOCKED" if failure_code else "UNLOCKED",
+        "failure_code": str(failure_code),
+        "checksums": describe_checksums(msg),
+        "lock_cause": lock_cause(msg),
+        "model_code": f"0x{msg[19]:02X}",
+        "battery_type": str(nibble_swap(msg[11])),
+        "damage_rating": str((msg_nybble(msg, NYBBLE_DAMAGE_RATING) >> 1) & 0x07),
+        # synrais' BTC04-derived formulas; whether they hold on our packs is unconfirmed.
+        "overdischarge_idx": f"{overdischarge} (~{clamp_pct(160 - 5 * overdischarge)}%?)",
+        "overload_idx": f"{overload} (~{clamp_pct(5 * overload - 160)}%?)",
+    })
+    return decoded
+
+
+def deci_kelvin_to_c(raw: int) -> str:
+    # 1/10 K (SBS convention) per rosvall, PocketOBI and PackScope. Read as 1/100 C, as this
+    # tool did before, every pack sat at ~30 C on every day, even straight off the charger.
+    return f"{raw / 10 - 273.15:.2f}"
+
+
+def decode_lxt_data(payload: bytes) -> dict[str, str]:
+    cells = [u16le(payload, o) / 1000 for o in (2, 4, 6, 8, 10)]
+    decoded = {"pack_v": f"{u16le(payload, 0) / 1000:.3f}", "cells_v": str(cells),
+               "temp1_c": deci_kelvin_to_c(u16le(payload, 14))}
+    if len(payload) >= 18:
+        decoded["temp2_c"] = deci_kelvin_to_c(u16le(payload, 16))
+        decoded["temp_raw"] = f"{u16le(payload, 14)} {u16le(payload, 16)}"
+    if len(payload) >= 25:
+        decoded["soc_pct"] = f"{u16le(payload, 21) / 256:.1f}"
+        decoded["real_capacity_mah"] = str(u16le(payload, 23))
+    if len(payload) >= 0x69:
+        decoded["target_capacity_mah"] = str(u16le(payload, 0x1D))
+        decoded["error_status"] = f"0x{payload[0x30]:02X}"
+        decoded["error_counters"] = hex_dump(payload[0x57:0x5D])
+        decoded["stability_count"] = str(u16le(payload, 0x67))
+    return decoded
+
+
+def decode_memory_read(name: str, payload: bytes) -> dict[str, str]:
+    if name == "lxt_data_ext":
+        return decode_lxt_data(payload)
+    body, ack = payload[:-1], payload[-1]
+    decoded = {"ack": "06 ok" if ack == ACK else f"{ack:02X} (no ACK)"}
+    if name == "d4_assembly_date":
+        decoded["date"] = f"{body[2]:02d}/{body[1]:02d}/20{body[0]:02d}"
+    elif name == "d4_0150":
+        decoded["u16le"] = str(u16le(body, 0))
+    elif name == "d4_od_events":
+        decoded["count"] = str(body[0])
+    elif name == "d4_overload":
+        # synrais' layout: three 10-bit counters. PocketOBI masks the third with 0x0F (8 bits).
+        first = (body[0] >> 6) | (body[1] << 2)
+        second = body[3] | ((body[4] & 0x03) << 8)
+        third = (body[5] >> 4) | ((body[6] & 0x3F) << 4)
+        decoded["counters"] = f"{first} {second} {third}"
+    elif name == "d7_charge_level":
+        decoded["u32le"] = str(int.from_bytes(body[:4], "little"))
+    elif name == "d7_current":
+        decoded["amps"] = f"{(32768 - u16le(body, 0)) / 100:.2f}"
+    return decoded
+
+
+MEMORY_READ_LENGTHS = {read.name: read.rsp_len for read in MEMORY_READS}
+
+
 def decode_known(name: str, payload: bytes) -> dict[str, str]:
     """Interprets a payload as if the battery used the known LXT/F0513 layouts."""
     if all(b == 0xFF for b in payload):
         return {"hint": "all 0xFF = nobody pulled the line low (no answer)"}
     if all(b == 0x00 for b in payload):
         return {"hint": "all 0x00 = line held low (short, or BMS busy)"}
-    if name == "lxt_msg" and len(payload) >= 40:
-        decoded = decode_rom(payload[:8])
-        decoded.update({
-            "capacity_if_lxt": f"{nibble_swap(payload[24]) / 10:.1f}Ah",
-            # Same formula as the web UI, which marks the value "Charge count*" (unverified).
-            "charge_count_if_lxt": str(
-                ((nibble_swap(payload[34]) << 8) | nibble_swap(payload[35])) & 0x0FFF),
-            "lock_if_lxt": "LOCKED" if payload[28] & 0x0F else "UNLOCKED",
-            "status_if_lxt": f"0x{payload[27]:02X}",
-        })
-        return decoded
+    name = name.removeprefix(TESTMODE_PREFIX)
+    if name == "lxt_msg" and len(payload) >= MSG_OFFSET + MSG_LEN:
+        return decode_lxt_msg(payload)
     if name == "lxt_model":
         return {"ascii": payload[:7].decode("ascii", errors="replace")}
-    if name == "lxt_data" and len(payload) >= 18:
-        cells = [u16le(payload, o) / 1000 for o in (2, 4, 6, 8, 10)]
-        return {"pack_v": f"{u16le(payload, 0) / 1000:.3f}", "cells_v": str(cells),
-                "temp1_c": f"{u16le(payload, 14) / 100:.2f}"}
+    if name == "lxt_data" and len(payload) >= 16:
+        return decode_lxt_data(payload)
+    if name in MEMORY_READ_LENGTHS:
+        # The decoders index fixed offsets; `compare` may feed them dumps of any length.
+        if len(payload) != MEMORY_READ_LENGTHS[name]:
+            return {"hint": f"{len(payload)} bytes; expected {MEMORY_READ_LENGTHS[name]}"}
+        return decode_memory_read(name, payload)
     if name in ("f0513_model", "f0513_version"):
         # Firmware stores these 2 bytes swapped; the site renders them as "BL" + hex.
         return {"as_model": f"BL{payload[0]:X}{payload[1]:X}"}
     if name == "f0513_temp":
-        return {"temp_c": f"{u16le(payload, 0) / 100:.2f}"}
+        return {"temp_c": deci_kelvin_to_c(u16le(payload, 0)), "temp_raw": str(u16le(payload, 0))}
     if name.startswith("f0513_vcell"):
         return {"volts": f"{u16le(payload, 0) / 1000:.3f}"}
     if len(payload) == 2:
@@ -257,7 +514,39 @@ def run_step(name: str, request_desc: str, action: Callable[[], bytes],
     return Step(name, request_desc, ok=True, response=hex_dump(payload), decoded=decoder(payload))
 
 
-def probe(link: ObiLink, log: Callable[[str], None]) -> dict[str, object]:
+def testmode_steps(link: ObiLink) -> list[Step]:
+    """MEMORY_READS again inside test mode, in one session so ENABLE never drops."""
+    reads = [r for r in MEMORY_READS if r.name not in TESTMODE_SKIP]
+    transactions = [Transaction(TESTMODE_ENTER, 1)]
+    transactions += [
+        Transaction(bytes([r.cmd]) + r.data, r.rsp_len,
+                    delay_ms=TESTMODE_GAP_MS if i else TESTMODE_SETTLE_MS)
+        for i, r in enumerate(reads)
+    ]
+    transactions.append(Transaction(TESTMODE_EXIT, 1, delay_ms=TESTMODE_GAP_MS))
+    try:
+        replies = link.session(transactions)
+    except ObiError as exc:
+        return [Step(f"{TESTMODE_PREFIX}session", "D1 test-mode session", ok=False, error=str(exc))]
+
+    def ack_step(name: str, write: bytes, reply: TransactionReply) -> Step:
+        # Inherits the all-FF/all-00 hint, so a silent BMS isn't summarized as "real data".
+        decoded = decode_known(name, reply.read)
+        if "hint" not in decoded:
+            decoded = {"ack": "06 ok" if reply.read == bytes([ACK]) else "no ACK"}
+        return Step(name, hex_dump(write), ok=True, response=hex_dump(reply.read), decoded=decoded)
+
+    steps = [ack_step(f"{TESTMODE_PREFIX}enter", TESTMODE_ENTER, replies[0])]
+    for read, reply in zip(reads, replies[1:-1]):
+        name = TESTMODE_PREFIX + read.name
+        steps.append(Step(name, f"{read.cmd:02X} {hex_dump(read.data)} rsp_len={read.rsp_len}",
+                          ok=True, response=hex_dump(reply.read),
+                          decoded=decode_known(name, reply.read)))
+    steps.append(ack_step(f"{TESTMODE_PREFIX}exit", TESTMODE_EXIT, replies[-1]))
+    return steps
+
+
+def probe(link: ObiLink, log: Callable[[str], None], testmode: bool = False) -> dict[str, object]:
     report: dict[str, object] = {"timestamp": datetime.now().isoformat(timespec="seconds")}
     report["firmware"] = link.version()
     log(f"firmware {report['firmware']}")
@@ -287,12 +576,16 @@ def probe(link: ObiLink, log: Callable[[str], None]) -> dict[str, object]:
         record(step)
         rom_steps.append(step)
 
-    for known in KNOWN_READS:
+    for known in KNOWN_READS + MEMORY_READS:
         record(run_step(
             known.name, f"{known.cmd:02X} {hex_dump(known.data)} rsp_len={known.rsp_len}",
             lambda k=known: link.request(k.cmd, k.data, k.rsp_len),
             lambda payload, k=known: decode_known(k.name, payload),
         ))
+
+    if testmode:
+        for step in testmode_steps(link):
+            record(step)
 
     report["steps"] = [asdict(s) for s in steps]
     report["summary"] = summarize(presence, rom_steps, steps)
@@ -310,6 +603,9 @@ def summarize(presence: DebugResult, rom_steps: list[Step], steps: list[Step]) -
     answered = [s.name for s in steps
                 if s.ok and "hint" not in s.decoded and not s.name.startswith("rom@")]
     lines.append(f"known commands with real data: {', '.join(answered) or 'none'}")
+    msg = next((s for s in steps if s.name == "lxt_msg" and "lock_cause" in s.decoded), None)
+    if msg is not None:
+        lines.append(f"lock cause: {msg.decoded['lock_cause']}")
     return lines
 
 
@@ -358,6 +654,25 @@ def find_previous_reads(rom: str, dumps_dir: Path) -> list[tuple[Path, dict[str,
 # changes on every read, so for those only the decoded values are compared.
 BYTE_DIFF_STEPS = ("lxt_msg",)
 
+# What each lxt_msg payload byte is believed to hold (docs/findings.md), so diffs read alone.
+LXT_MSG_BYTE_LABELS = {
+    **dict.fromkeys((0, 1, 2), "ROM date"),
+    **dict.fromkeys((6, 7), "ROM serial"),
+    **dict.fromkeys((16, 17), "rewritten on charge/unlock"),
+    24: "capacity",
+    25: "flags, low nybble = charger lock",
+    27: "model code",
+    28: "failure code + CS0",
+    29: "CS1 + CS2",
+    31: "damage rating",
+    32: "overdischarge idx",
+    33: "overload idx",
+    **dict.fromkeys((34, 35), "charge count"),
+    **dict.fromkeys((36, 37), "second counter"),
+    38: "rewritten on charge",
+    39: "AUX0 + AUX1",
+}
+
 
 def redecode(name: str, step: dict[str, object]) -> dict[str, str]:
     if not step["response"]:
@@ -375,7 +690,9 @@ def diff_reports(old: dict[str, object], new: dict[str, object]) -> list[str]:
             old_bytes, new_bytes = bytes.fromhex(before["response"]), bytes.fromhex(after["response"])
             for offset, (a, b) in enumerate(zip(old_bytes, new_bytes)):
                 if a != b:
-                    lines.append(f"{name}[{offset}]: {a:02X} -> {b:02X}")
+                    label = LXT_MSG_BYTE_LABELS.get(offset)
+                    suffix = f"  ({label})" if label else ""
+                    lines.append(f"{name}[{offset}]: {a:02X} -> {b:02X}{suffix}")
         # Re-decoded from raw bytes: dumps from older tool versions stored other decoded keys.
         old_decoded, new_decoded = redecode(name, before), redecode(name, after)
         for key in old_decoded.keys() | new_decoded.keys():
@@ -437,6 +754,9 @@ def main(argv: list[str] | None = None) -> int:
     p_probe = sub.add_parser("probe", help="run the read-only diagnostic and save a JSON dump")
     p_probe.add_argument("--port", required=True)
     p_probe.add_argument("--label", default="battery", help="name used in the dump file")
+    p_probe.add_argument("--testmode", action="store_true",
+                         help="also read BMS memory inside test mode (enters and leaves it)")
+    p_probe.add_argument("--yes", action="store_true", help="skip the --testmode confirmation")
 
     p_raw = sub.add_parser("raw", help="send arbitrary 1-Wire bytes via the debug command")
     p_raw.add_argument("--port", required=True)
@@ -469,6 +789,13 @@ def main(argv: list[str] | None = None) -> int:
         if input().strip().lower() != "y":
             return 1
 
+    if args.command == "probe" and args.testmode and not args.yes:
+        print("--testmode puts the BMS in test mode (its checksums read as broken meanwhile) and "
+              "leaves it with CC D9 FF FF; ENABLE dropping afterwards also ends it. "
+              "Continue? [y/N] ", end="")
+        if input().strip().lower() != "y":
+            return 1
+
     try:
         link, port = open_link(args.port)
     except ObiError as exc:
@@ -484,7 +811,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"idle={result.idle_level} presence={result.presence} read: {hex_dump(result.read)}")
             return 0
 
-        report = probe(link, print)
+        report = probe(link, print, testmode=args.testmode)
         report["label"] = args.label
         DUMPS_DIR.mkdir(exist_ok=True)
         # Before saving, so the new dump isn't compared with itself.

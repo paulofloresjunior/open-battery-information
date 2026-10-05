@@ -38,9 +38,16 @@ Byte meanings found so far live in `docs/findings.md`.
 .venv/Scripts/python -m unittest discover tools -k DecodeTests        # filter by name
 ```
 
-`probe` must stay read-only: test mode (`33 D9 96 A5`), LEDs (`33 DA ..`) and clear-errors
-(`33 DA 04`) change BMS state and are intentionally excluded; arbitrary bytes go through `raw`,
-which asks for confirmation.
+`probe` must stay read-only: LEDs (`33 DA ..`), clear-errors (`33 DA 04`) and frame writes
+(`CC F0 00` / `33 0F 00` / `33 55 A5`) change BMS state and are intentionally excluded; arbitrary
+bytes go through `raw`, which asks for confirmation. The one exception is `probe --testmode`
+(asks for confirmation): it enters test mode, repeats the `MEMORY_READS` (`D4`/`D7`/`DC` reads
+taken from other projects) and leaves with `CC D9 FF FF`, all in one `0xD1` session.
+
+The `lxt_msg` decode (checksums CS0–CS2/AUX0–1, failure code, lock cause, counters) follows the
+nybble map in `docs/findings.md`; tests use real dumps as fixtures, so keep them in sync. Temperatures
+are 1/10 K. Facts taken from PocketOBI/PackScope (PolyForm Noncommercial) and synrais (no license)
+must be re-implemented, never copied — see "Sources and licenses" in `docs/findings.md`.
 
 - **Versioning:** `scripts/get_version.py` (pre-script for every env) reads the latest git tag
   (`vX.Y.Z`) via `git describe --tags --abbrev=0` and injects `ARDUINO_OBI_VERSION_{MAJOR,MINOR,PATCH}`.
@@ -73,7 +80,14 @@ Commands:
 - `0xD0` — debug/probe (not used by the web UI). `data = [flags, post_reset_delay×10µs,
   inter_byte_delay_µs, bytes to write…]`, flag bit0 = reset first. Payload =
   `[idle_line_level, presence (0xFF = no reset), rsp_len−2 bytes read…]`. `rsp_len` is clamped to 253.
+- `0xD1` — session (not used by the web UI): several transactions with ENABLE held high, because
+  dropping ENABLE ends BMS test mode. `data` = repeated `[flags, delay_ms, write_len, read_len,
+  write…]` (flag bit0 = reset first); payload = per transaction `[presence (0xFF = no reset),
+  read bytes…]`. The whole request is validated before touching the bus; malformed → `rsp_len = 0`.
 - anything else → empty response (`rsp_len = 0`).
+
+`rsp_len` is clamped so reads fit the 255-byte buffer (253 payload; 245 for `0x33`, which stores the
+ROM in front). A frame whose data bytes stop arriving for 50 ms is dropped instead of blocking.
 
 The magic delays (`delayMicroseconds(400)` after reset, `90` µs between bytes) are protocol timing for
 the Makita BMS — keep them unless you have hardware to verify.
