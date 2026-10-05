@@ -86,7 +86,7 @@ BL1815N #3  41 43 CB 95 1A 68 00 00 C1 C1 40 41 01 E0 02 03 F0 D0 8E BE 5F 58 00
 | 31 | `01`, `03`, `21`, `63` seen; went `01` → `03` on BL1840B #1 after a full discharge + full charge | unknown, possibly flags |
 | 34–35 | charge count: nibble-swap both, big-endian, low 12 bits | **confirmed:** went 14 → 15 after one full charge through the BMS; 3 on a pack the owner charged ~2–3 times. Charging cells directly (bypassing the BMS) does not increment it |
 | 36–37 | second counter, same encoding as 34–35 (`00 A0` = 10, `00 B0` = 11) | **hypothesis:** full-charge count. Always ≤ charge count on all 8 chip packs (3/3, 11/15, 5/10, 126/132…); went 10 → 11 together with the charge count on a full discharge + full charge |
-| 38 | `00`–`05`; went `04` → `05` after a full discharge | **weak hypothesis:** discharge-to-cutoff count. `00` on the owner's never-drained BL1460B, but also `00` on the 0 V BL1815N #2/#3 (maybe drained in storage with the BMS asleep) |
+| 38 | `00`–`05`; went `04` → `05` across a full discharge + full charge | unknown. **Not** a discharge-to-cutoff count: a later full discharge alone left it (and the whole message) unchanged, so the increment happened during the charge |
 | 39 | changes with the counters (`E1` → `13`), but not when Clear errors rewrote 16–17/28–29 | unknown; not a sum/XOR of any suffix of the payload |
 
 ## Before/after Clear errors (BL1815N #1)
@@ -109,6 +109,13 @@ After the per-cell recovery, the owner fully discharged the pack in use and full
 on the Makita charger. Cells went to 4.087 4.086 4.080 4.080 4.081 (7 mV spread), so the recovery
 held. Message bytes that changed: 31 `01`→`03`, 35 `E0`→`F0` (charge count 14→15), 37 `A0`→`B0`
 (second counter 10→11), 38 `04`→`05`, 39 `E1`→`13`.
+
+A full discharge in use afterwards changed **no** message byte, so the counters update on charge.
+It also exposed the real weak cells. Spread was 7 mV full and 363 mV empty: 3.087 3.136 3.448
+3.446 3.450. Cells 1–2 have less capacity: they sat slightly high when full, and in the first
+read (partial charge) they were at ~4.03 V while 3–5 were at 3.666. They limit the pack's runtime.
+**Judge balance at low state of charge.** A full pack hides capacity mismatch, because the
+charger tops every cell to the same voltage.
 
 ## Live data (`lxt_data`, LXT chip only)
 
