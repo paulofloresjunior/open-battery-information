@@ -79,14 +79,15 @@ BL1815N #3  41 43 CB 95 1A 68 00 00 C1 C1 40 41 01 E0 02 03 F0 D0 8E BE 5F 58 00
 |---|---|---|
 | 8–13 | identical across the three BL1815N; BL1830, BL1840B and BL1850B share another value | **hypothesis:** model/family constant |
 | 24 | capacity, nibble-swapped, in 0.1 Ah (`F0`→1.5, `82`→4.0, `23`→5.0, `C3`→6.0) | confirmed on LXT packs; BL1830 decodes to 2.8 Ah (see open questions) |
-| 16–17 | always a repeated pair (`C1 C1`, `94 94`…). Rewritten by Clear errors (`C1 C1` → `74 74`), and on BL1840B #1 after disassembly + per-cell charging (`C1 C1` → `94 94`), lock unchanged | **hypothesis:** rewritten when the BMS resets (both events can restart it). Not a health flag (`94 94` also on the badly discharged BL1840B #2) and not a sum/XOR/nibble-sum checksum |
+| 16–17 | always a repeated pair (`C1 C1`, `94 94`, `74 74`, `24 24`, `B1 B1`). Rewritten by Clear errors (`C1`→`74`), by disassembly + per-cell charging (`C1`→`94`), and by a plain charge on the Makita charger (`94`→`24`) | **hypothesis:** part of a last-charge record. Not a BMS-reset marker (a plain charge changed it), not a health flag (`94 94` also on the badly discharged BL1840B #2), not a sum/XOR/nibble-sum checksum |
 | 27 | `0x67` on BL1830/BL1840B/BL1460B, `0xBE` on all BL1815N, `0x45` on BL1850B | **not touched by Clear errors** (before/after, below), so not the lock status. Per-pack/per-model value of unknown meaning |
 | 28 low nibble | `F` = locked, `0` = unlocked | matches all 7 packs (same rule the web UI uses) |
 | 28–29 | locked: `5F 58` (both locked BL1815N), `9F 3E` (BL1830). Clear errors turned `5F 58` into `A0 B3` | **hypothesis:** lock record. Byte 28 after unlock is the bitwise NOT of before (`5F` → `A0`); `~9F` = `60`, the value on unlocked BL1840B/BL1850B. Byte 29 does not follow that rule |
 | 31 | `01`, `03`, `21`, `63` seen; went `01` → `03` on BL1840B #1 after a full discharge + full charge | unknown, possibly flags |
 | 34–35 | charge count: nibble-swap both, big-endian, low 12 bits | **confirmed:** went 14 → 15 after one full charge through the BMS; 3 on a pack the owner charged ~2–3 times. Charging cells directly (bypassing the BMS) does not increment it |
 | 36–37 | second counter, same encoding as 34–35 (`00 A0` = 10, `00 B0` = 11) | **hypothesis:** full-charge count. Always ≤ charge count on all 8 chip packs (3/3, 11/15, 5/10, 126/132…); went 10 → 11 together with the charge count on a full discharge + full charge |
-| 38 | `00`–`05`; went `04` → `05` across a full discharge + full charge | unknown. **Not** a discharge-to-cutoff count: a later full discharge alone left it (and the whole message) unchanged, so the increment happened during the charge |
+| 38 | `00`–`05`; `04` → `05` on one charge, `05` → `04` on the next | **not a counter** (it went down). Updated on charge, not on discharge. Maybe a state or health bucket |
+| 29 | changes on charge (`A3` → `A5`) and on Clear errors (`58` → `B3`) | unknown, updated on charge |
 | 39 | changes with the counters (`E1` → `13`), but not when Clear errors rewrote 16–17/28–29 | unknown; not a sum/XOR of any suffix of the payload |
 
 ## Before/after Clear errors (BL1815N #1)
@@ -116,6 +117,12 @@ It also exposed the real weak cells. Spread was 7 mV full and 363 mV empty: 3.08
 read (partial charge) they were at ~4.03 V while 3–5 were at 3.666. They limit the pack's runtime.
 **Judge balance at low state of charge.** A full pack hides capacity mismatch, because the
 charger tops every cell to the same voltage.
+
+The next charge, from that empty state, changed: 16–17 `94 94`→`24 24`, 29 `A3`→`A5`, 35 (charge
+count 15→16), 37 (second counter 11→12), 38 `05`→`04`, 39 `13`→`33`. Spread when full: 10 mV,
+with cells 1–2 slightly high again. So 16–17, 29, 38 and 39 look like a record rewritten on every
+charge. Both charges here started from empty, so they can't tell "full charge" from "any charge"
+for the second counter. A partial charge would.
 
 ## Live data (`lxt_data`, LXT chip only)
 
