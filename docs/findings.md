@@ -198,16 +198,20 @@ which is the board/MOSFET is unknown to everyone. PocketOBI reports a dead NTC a
 (raw ~2430).
 
 The F0513 chip (BL1830) answers `FF` to `lxt_data` and `lxt_model`. Its cells and temperature come
-from the per-cell commands `CC 31`..`CC 35` and `CC 52` (also 1/10 K: raw 3022 = 29.05 °C).
+from the per-cell commands `CC 31`..`CC 35` and `CC 52` (also 1/10 K: raw 3022 = 29.05 °C). It also
+answers `FF` to every memory read below (`DC 0B`, `D4`, `D7`), so none of that data exists for it.
+Its two low cells kept self-discharging at rest: 0.748/0.781 V on 2026-10-01, 0.581/0.586 V on
+2026-10-10, while cells 1–3 held ~3.81 V.
 
-Extended block (`D7 00 00 FF`, reading past byte 28; synrais' v1.6.0 test build, **unchecked**):
+Extended block (`D7 00 00 FF`, reading past byte 28; synrais' v1.6.0 test build). It answers outside
+test mode on both BL1815N read; the meanings are still synrais':
 
-| Offset | Meaning |
-|---|---|
-| 0x1D–0x1E | target capacity, mAh |
-| 0x30 | error status |
-| 0x57–0x5C | six error counters |
-| 0x67–0x68 | "stability count" (SOC recalibration) |
+| Offset | Meaning | BL1815N #1 / #2 |
+|---|---|---|
+| 0x1D–0x1E | target capacity, mAh | 1300 / 1418 (1.5 Ah packs) |
+| 0x30 | error status | `00` / `00` |
+| 0x57–0x5C | six error counters | `00 00 23 00 00 80` / `00 03 20 00 00 00` |
+| 0x67–0x68 | "stability count" (SOC recalibration) | 110 / 2 |
 
 ## Commands from other projects
 
@@ -220,9 +224,9 @@ The probe sends every LXT read here in its default run, and again inside test mo
 | `CC DC 0B` | 17 B, last `06` | identifies a "type 0" BMS (our LXT packs) | synrais |
 | `CC DC 0A` (test mode) | 17 B, last `06` | identifies "type 2" | synrais |
 | `CC D4 2C 00 02` | 3 B, last `06` | identifies "type 3" | synrais |
-| `CC D4 00 00 03` | YY MM DD + ACK | **assembly** date (binary), not the ROM date | PocketOBI |
-| `CC D4 50 01 02` | u16 LE + ACK | PocketOBI: state of charge. synrais: health, `ratio = raw / capacity code`, > 80 = full | conflicting |
-| `CC D4 BA 00 01` | u8 + ACK | over-discharge event count (`FF` = the D4 path didn't answer) | both |
+| `CC D4 00 00 03` | YY MM DD + ACK | **assembly** date (binary), not the ROM date. Ours: 3–4 days before the ROM date (BL1815N #1 11/07 vs 15/07/2019, #2 04/10 vs 07/10/2021) | PocketOBI |
+| `CC D4 50 01 02` | u16 LE + ACK | **equals the "real capacity" in `lxt_data` 23–24** on both packs read (BL1815N #1 1211 = 1211, #2 1296 = 1296), with SoC at 0 % on both, so not state of charge. Fits synrais' "health" reading, **diverges** from PocketOBI's SoC | PocketOBI, synrais |
+| `CC D4 BA 00 01` | u8 + ACK | over-discharge event count (`FF` = the D4 path didn't answer). Ours: 69 on the 0 V BL1815N #2, but 0 on BL1815N #1 despite its 0 V cell 2 | both |
 | `CC D4 8D 00 07` | 7 B + ACK | packed overload counters, see below | both |
 | `CC D7 19 00 04` | u32 LE + ACK | coulomb counter | synrais |
 | `CC D7 61 03 02` | u16 LE + ACK | average current `(32768 − raw)/100` A | synrais, speculative |
@@ -270,7 +274,7 @@ Kept for reference. Each may come from a real measurement on packs we don't have
 | Payload 32/33 percentages (`160 − 5x`, `5x − 160`) | synrais (BTC04 types 5/6) | three BL1815N of one model give 20 %, 80 %, 75 %. Plausible for the two 0 V packs, unchecked |
 | Payload 32/33 as protection thresholds (`~x>>4 × 5.33 %`, `(x&0x1F) × 5 %`) | PocketOBI, PackScope | gives 0 % on BL1460B and 80 % on healthy BL1840B, so it doesn't behave like a fixed design limit |
 | CS1 doesn't matter to chargers | synrais (1 BL1860B, charger model unknown) | rosvall says the BTC04 checker does check it. May differ per charger/checker |
-| `D4` reads only ACK in test mode | PackScope | synrais checks the ACK outside test mode. `probe --testmode` reads both ways to settle it |
+| `D4` reads only ACK in test mode | PackScope | **diverges:** outside test mode, every `D4`/`D7` read returned data + `06` on both BL1815N (2026-10-10). Probably their bridge setup, as with test mode itself |
 | `D6 58D` / `D6 309` = latched fault marker | PocketOBI ≤ 2.1.0 | retracted by PocketOBI itself: healthy BL1850B read the same constant |
 | SoH = 100 − cycles / 8.96 | PocketOBI | their own heuristic, not BMS data |
 | All-`FF` frame with presence = pre-LXT HC08 chip (Freescale MC908JK3E), no cell protection, don't charge | synrais | our silent packs have no presence, so a different case |
@@ -306,8 +310,9 @@ Kept for reference. Each may come from a real measurement on packs we don't have
 - Bytes 16–17: what they record, and why the value differs per pack (`74` vs `94`).
 - Byte 38 and the second counter (36–37): a partial charge would tell "full charge" from "any charge".
 - Payload 19 (battery type) and 25 high nybble: what they encode, given BL1460B and BL1815N share 20.
-- `lxt_data` 12–13, and whether the extended `D7` block and the `D4` reads answer outside test mode.
-- `D4 0x150`: state of charge or health?
+- `lxt_data` 12–13.
+- `D4 0x150` = real capacity on two BL1815N: does it hold on other models (BL1840B, BL1460B)?
+- Meanings of the extended `D7` block are still synrais' alone; error counters differ per pack.
 - Whether non-star packs (BL1415, clone) carry anything on other contacts of the yellow terminal block.
 
 ## Sources and licenses
